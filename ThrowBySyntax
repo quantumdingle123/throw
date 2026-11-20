@@ -1,0 +1,261 @@
+-- ==============================================================================
+-- [ SYNTAX HUB - THROW (ThrowBySyntax) ]
+-- Built with Syntaxis GUI Library v2.3.0 (https://github.com/quantumdingle123/GUILib)
+-- Repository: https://github.com/quantumdingle123/throw
+-- ==============================================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Shared state across re-executions for clean teardown
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if env.ThrowBySyntaxState then
+    local prev = env.ThrowBySyntaxState
+    prev.Running = false
+    prev.SessionId = (prev.SessionId or 0) + 1
+    if prev.Window and type(prev.Window.Destroy) == "function" then
+        pcall(function()
+            prev.Window:Destroy()
+        end)
+    end
+end
+
+local state = {
+    Running = false,
+    Busy = false,
+    SessionId = (env.ThrowBySyntaxState and env.ThrowBySyntaxState.SessionId or 0) + 1,
+    Window = nil
+}
+env.ThrowBySyntaxState = state
+
+local CONFIG = {
+    TargetCFrame = CFrame.new(
+        -0.8164, 5.5000, -36.3795,
+        0.5645, 0.0000, 0.8255,
+        -0.0000, 1.0000, -0.0000,
+        -0.8255, -0.0000, 0.5645
+    ),
+    MaxDistanceStuds = 2.0,
+    PostTeleportWait = 0.12,
+    FallbackValue = 0.995,
+    InvertYScale = true,
+    MeterTravelWait = 0.45,
+    StepDelay = 0.12,
+    PostCompleteDelay = 1.50
+}
+
+-- ==============================================================================
+-- [ AUTO THROW ENGINE ]
+-- ==============================================================================
+local cachedRemotes = nil
+
+local function getThrowRemotes()
+    if cachedRemotes then
+        return cachedRemotes
+    end
+    local remotesFolder = ReplicatedStorage:WaitForChild("Remotes", 10)
+    if not remotesFolder then
+        return nil
+    end
+    local remotes = {
+        Start        = remotesFolder:WaitForChild("Throw_Start", 10),
+        MeterStarted = remotesFolder:WaitForChild("Throw_MeterStarted", 10),
+        Resolve      = remotesFolder:WaitForChild("Throw_Resolve", 10),
+        Revealed     = remotesFolder:WaitForChild("Throw_Revealed", 10),
+        Complete     = remotesFolder:WaitForChild("Throw_Complete", 10)
+    }
+    if remotes.Start and remotes.MeterStarted and remotes.Resolve and remotes.Revealed and remotes.Complete then
+        cachedRemotes = remotes
+        return cachedRemotes
+    end
+    return nil
+end
+
+local function ensureAtThrowSpot()
+    local character = LocalPlayer.Character
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then
+        return false
+    end
+
+    if (rootPart.Position - CONFIG.TargetCFrame.Position).Magnitude > CONFIG.MaxDistanceStuds then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        rootPart.CFrame = CONFIG.TargetCFrame
+        task.wait(CONFIG.PostTeleportWait)
+    end
+
+    return true
+end
+
+local function getTargetResolveValue(startData)
+    if type(startData) == "table" then
+        local serverGoal = tonumber(startData.Target or startData.SweetSpot or startData.Goal)
+        if serverGoal then
+            return serverGoal
+        end
+    end
+
+    local throwSeq = PlayerGui:FindFirstChild("ThrowSequence")
+    local meter = throwSeq and throwSeq:FindFirstChild("Meter")
+    local bar = meter and meter:FindFirstChild("Bar")
+
+    if bar then
+        for _, child in ipairs(bar:GetChildren()) do
+            if child:IsA("GuiObject") and child.Name ~= "Marker" then
+                local lower = child.Name:lower()
+                if lower:find("target") or lower:find("zone") or lower:find("perfect")
+                or lower:find("sweet") or lower:find("green") or lower:find("area") then
+                    local targetY = child.Position.Y.Scale
+                    return CONFIG.InvertYScale and (1 - targetY) or targetY
+                end
+            end
+        end
+    end
+
+    return CONFIG.FallbackValue
+end
+
+local function isSessionAlive(sessionId)
+    return state.SessionId == sessionId
+        and state.Window ~= nil
+        and state.Window.Context ~= nil
+        and state.Window.Context.IsAlive == true
+end
+
+local function isLoopActive(sessionId)
+    return state.Running and isSessionAlive(sessionId)
+end
+
+local function runThrowCycle(sessionId)
+    local throwRemotes = getThrowRemotes()
+    if not throwRemotes then
+        task.wait(0.5)
+        return
+    end
+
+    if not ensureAtThrowSpot() then
+        task.wait(0.25)
+        return
+    end
+
+    local _, startData = pcall(function()
+        return throwRemotes.Start:InvokeServer()
+    end)
+    task.wait(CONFIG.StepDelay)
+    if not isSessionAlive(sessionId) then return end
+
+    pcall(function()
+        throwRemotes.MeterStarted:FireServer()
+    end)
+    task.wait(CONFIG.MeterTravelWait)
+    if not isSessionAlive(sessionId) then return end
+
+    local resolveValue = getTargetResolveValue(startData)
+    pcall(function()
+        throwRemotes.Resolve:InvokeServer(resolveValue)
+    end)
+    task.wait(CONFIG.StepDelay)
+    if not isSessionAlive(sessionId) then return end
+
+    pcall(function()
+        throwRemotes.Revealed:FireServer()
+    end)
+    task.wait(CONFIG.StepDelay)
+    if not isSessionAlive(sessionId) then return end
+
+    pcall(function()
+        throwRemotes.Complete:InvokeServer()
+    end)
+
+    -- Wait for plot transition, then return to throwing area
+    task.wait(CONFIG.PostCompleteDelay)
+    if not isSessionAlive(sessionId) then return end
+    ensureAtThrowSpot()
+end
+
+local function startAutoThrowLoop()
+    if state.Busy then
+        return
+    end
+
+    local mySessionId = state.SessionId
+    task.spawn(function()
+        state.Busy = true
+        while isLoopActive(mySessionId) do
+            runThrowCycle(mySessionId)
+        end
+        if state.SessionId == mySessionId then
+            state.Busy = false
+        end
+        print("[AutoThrow] Stopped cleanly.")
+    end)
+end
+
+-- ==============================================================================
+-- [ GUI INITIALIZATION & CONTROLS VIA GUILIB ]
+-- ==============================================================================
+local SyntaxisLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/quantumdingle123/GUILib/main/SyntaxisLib.lua"))()
+
+local UiState = {
+    themeName = "Sapphire"
+}
+
+local Window = SyntaxisLib:CreateWindow({
+    Title = "Syntaxis",
+    GameName = "Throw",
+    GuiName = "ThrowBySyntaxGUI",
+    Theme = UiState.themeName,
+    ShowLoader = true,
+    LoaderLayout = "B",
+    LoaderDuration = 2.6,
+    LoaderBlur = true,
+    State = UiState
+})
+
+state.Window = Window
+
+if Window.ScreenGui then
+    Window.ScreenGui.Destroying:Connect(function()
+        state.Running = false
+    end)
+end
+
+-- Sidebar Tab: Farm
+local FarmTab = Window:CreateTab("Farm", "Farm")
+
+-- Category: Auto Farm
+local CatAutoFarm = FarmTab:CreateCategory("Auto Farm", true, 1)
+
+-- Feature: Auto Throw
+CatAutoFarm:CreateToggle("Auto Throw", "Automatically teleports to throw spot and hits target meter", false, function(enabled)
+    state.Running = enabled
+    if enabled then
+        print("[AutoThrow] Enabled.")
+        Window:Notify({
+            Title = "Auto Throw",
+            Content = "Auto Throw enabled.",
+            Duration = 2
+        })
+        startAutoThrowLoop()
+    else
+        print("[AutoThrow] Turning off after current throw finishes...")
+        Window:Notify({
+            Title = "Auto Throw",
+            Content = "Turning off after current throw finishes...",
+            Duration = 2
+        })
+    end
+end)
+
+-- Sidebar Tab: Settings
+Window:CreateSettingsTab("Settings", "Settings", {
+    OnThemeSelected = function(themeName)
+        UiState.themeName = themeName
+    end
+})
+
+Window:Initialize()
