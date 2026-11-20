@@ -59,6 +59,9 @@ local CONFIG = {
     Food = {
         CheckInterval = 1.00,
         PostBuyDelay = 0.50
+    },
+    EquipBest = {
+        Interval = 60.0
     }
 }
 
@@ -95,7 +98,8 @@ local state = {
         Throw = false,
         Train = false,
         Upgrade = false,
-        Food = false
+        Food = false,
+        EquipBest = false
     },
     Minutes = {
         Throw = DEFAULT_MINUTES,
@@ -115,7 +119,8 @@ local state = {
     },
     Tokens = {
         Upgrade = 0,
-        Food = 0
+        Food = 0,
+        EquipBest = 0
     },
     IsShutDown = false
 }
@@ -281,6 +286,13 @@ local function getCurrentMoney()
     return nil
 end
 
+local function invokeEquipBest()
+    local rEquipBest = getRemote("Plot_EquipBest")
+    if rEquipBest then
+        callRemote(rEquipBest)
+    end
+end
+
 -- ==============================================================================
 -- [ AUTO THROW ENGINE ]
 -- ==============================================================================
@@ -347,6 +359,10 @@ local function runThrowCycle(sessionId, phaseToken)
     if not isSessionAlive(sessionId) then return end
 
     callRemote(rComplete)
+
+    if state.Desired.EquipBest and isSessionAlive(sessionId) then
+        invokeEquipBest()
+    end
 
     -- Wait for plot transition; only return to throw spot if Throw still owns the scheduler
     task.wait(CONFIG.Throw.PostCompleteDelay)
@@ -869,6 +885,30 @@ local function startAutoFoodLoop()
 end
 
 -- ==============================================================================
+-- [ AUTO EQUIP BEST PET ]
+-- ==============================================================================
+local function startAutoEquipBestLoop()
+    state.Tokens.EquipBest = state.Tokens.EquipBest + 1
+    local myToken = state.Tokens.EquipBest
+    local mySession = state.SessionId
+
+    task.spawn(function()
+        local nextEquipAt = os.clock()
+        while isSessionAlive(mySession) and state.Desired.EquipBest and state.Tokens.EquipBest == myToken do
+            if state.Desired.Throw then
+                -- Auto Throw handles equipping after each completed throw sequence
+                nextEquipAt = os.clock() + CONFIG.EquipBest.Interval
+            elseif os.clock() >= nextEquipAt then
+                invokeEquipBest()
+                nextEquipAt = os.clock() + CONFIG.EquipBest.Interval
+            end
+
+            task.wait(1)
+        end
+    end)
+end
+
+-- ==============================================================================
 -- [ TEARDOWN / SHUTDOWN ]
 -- ==============================================================================
 function state.Shutdown()
@@ -880,10 +920,12 @@ function state.Shutdown()
     state.Desired.Train = false
     state.Desired.Upgrade = false
     state.Desired.Food = false
+    state.Desired.EquipBest = false
     state.SessionId = state.SessionId + 1
     state.Farm.PhaseToken = state.Farm.PhaseToken + 1
     state.Tokens.Upgrade = state.Tokens.Upgrade + 1
     state.Tokens.Food = state.Tokens.Food + 1
+    state.Tokens.EquipBest = state.Tokens.EquipBest + 1
 
     disconnectAll(state.Farm.TrainConnections)
     if state.Farm.TrainStarted then
@@ -1021,6 +1063,27 @@ TrainTimeBox = CatAutoFarm:CreateTextbox(
         end
     end,
     4
+)
+
+CatAutoFarm:CreateToggle(
+    "Auto Equip Best Pet",
+    "Equips best pets after each throw (or every 60s when Auto Throw is off)",
+    false,
+    function(enabled)
+        state.Desired.EquipBest = (enabled == true)
+        if state.Desired.EquipBest then
+            if state.Desired.Throw then
+                safeNotify("Auto Equip Best Pet", "Enabled (equips after every throw).", 2.5)
+            else
+                safeNotify("Auto Equip Best Pet", "Enabled (equips every 60s while Auto Throw is off).", 2.5)
+            end
+            startAutoEquipBestLoop()
+        else
+            state.Tokens.EquipBest = state.Tokens.EquipBest + 1
+            safeNotify("Auto Equip Best Pet", "Auto Equip Best Pet disabled.", 2)
+        end
+    end,
+    5
 )
 
 -- Category 2: Auto Upgrades
