@@ -1,10 +1,11 @@
 -- ==============================================================================
--- [ SYNTAX HUB - THROW (ThrowBySyntax) ]
+-- [ SYNTAX HUB - THROW FOOD FOR ANIMALS (ThrowBySyntax) ]
 -- Built with Syntaxis GUI Library v2.3.0 (https://github.com/quantumdingle123/GUILib)
 -- Repository: https://github.com/quantumdingle123/throw
 -- ==============================================================================
 
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
@@ -12,9 +13,10 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- Shared state across re-executions for clean teardown
 local env = (type(getgenv) == "function" and getgenv()) or _G
-if env.ThrowBySyntaxState then
+if env.ThrowBySyntaxState and type(env.ThrowBySyntaxState.Shutdown) == "function" then
+    pcall(env.ThrowBySyntaxState.Shutdown)
+elseif env.ThrowBySyntaxState then
     local prev = env.ThrowBySyntaxState
-    prev.Running = false
     prev.SessionId = (prev.SessionId or 0) + 1
     if prev.Window and type(prev.Window.Destroy) == "function" then
         pcall(function()
@@ -23,74 +25,265 @@ if env.ThrowBySyntaxState then
     end
 end
 
-local state = {
-    Running = false,
-    Busy = false,
-    SessionId = (env.ThrowBySyntaxState and env.ThrowBySyntaxState.SessionId or 0) + 1,
-    Window = nil
-}
-env.ThrowBySyntaxState = state
+local DEFAULT_MINUTES = 10
+local MIN_MINUTES = 0.05
+local MAX_MINUTES = 1440
 
 local CONFIG = {
-    TargetCFrame = CFrame.new(
-        -0.8164, 5.5000, -36.3795,
-        0.5645, 0.0000, 0.8255,
-        -0.0000, 1.0000, -0.0000,
-        -0.8255, -0.0000, 0.5645
-    ),
-    MaxDistanceStuds = 2.0,
-    PostTeleportWait = 0.12,
-    FallbackValue = 0.995,
-    InvertYScale = true,
-    MeterTravelWait = 0.45,
-    StepDelay = 0.12,
-    PostCompleteDelay = 1.50
+    Throw = {
+        TargetCFrame = CFrame.new(
+            -0.8164, 5.5000, -36.3795,
+            0.5645, 0.0000, 0.8255,
+            -0.0000, 1.0000, -0.0000,
+            -0.8255, -0.0000, 0.5645
+        ),
+        MaxDistanceStuds = 2.0,
+        PostTeleportWait = 0.12,
+        FallbackValue = 0.995,
+        InvertYScale = true,
+        MeterTravelWait = 0.45,
+        StepDelay = 0.12,
+        PostCompleteDelay = 1.50
+    },
+    Train = {
+        StandOffset = CFrame.new(0, 2, 0),
+        MaxDistanceStuds = 5.0,
+        MonitorInterval = 1.00,
+        TapReactionDelay = 0.15,
+        TapCooldown = 0.05
+    },
+    Upgrade = {
+        CheckInterval = 1.00,
+        PostUpgradeDelay = 0.35
+    },
+    Food = {
+        CheckInterval = 1.00,
+        PostBuyDelay = 0.50
+    }
 }
 
--- ==============================================================================
--- [ AUTO THROW ENGINE ]
--- ==============================================================================
-local cachedRemotes = nil
+local MULTIPLIERS = {
+    k   = 1e3,
+    m   = 1e6,
+    b   = 1e9,
+    t   = 1e12,
+    qa  = 1e15,
+    qi  = 1e18,
+    sx  = 1e21,
+    sp  = 1e24,
+    oc  = 1e27,
+    no  = 1e30,
+    dc  = 1e33,
+    ud  = 1e36,
+    dd  = 1e39,
+    td  = 1e42,
+    qad = 1e45,
+    qid = 1e48,
+    sxd = 1e51,
+    spd = 1e54,
+    ocd = 1e57,
+    nod = 1e60,
+    vg  = 1e63
+}
 
-local function getThrowRemotes()
-    if cachedRemotes then
-        return cachedRemotes
+local nextSessionId = (env.ThrowBySyntaxState and env.ThrowBySyntaxState.SessionId or 0) + 1
+
+local state = {
+    SessionId = nextSessionId,
+    Window = nil,
+    Desired = {
+        Throw = false,
+        Train = false,
+        Upgrade = false,
+        Food = false
+    },
+    Minutes = {
+        Throw = DEFAULT_MINUTES,
+        Train = DEFAULT_MINUTES
+    },
+    Farm = {
+        SchedulerRunning = false,
+        ActiveMode = nil, -- "Throw" | "Train" | nil
+        PhaseToken = 0,
+        PhaseStart = 0,
+        TrainStarted = false,
+        TrainConnections = {},
+        AttachedBonusLayer = nil,
+        WatcherPhaseToken = nil,
+        MissingStandWarned = false,
+        ResetCountdownRequested = false
+    },
+    Tokens = {
+        Upgrade = 0,
+        Food = 0
+    },
+    IsShutDown = false
+}
+
+-- Forward declarations for UI control references used by background loops
+local ThrowTimeBox, TrainTimeBox
+local UpgradeToggle, FoodToggle
+
+-- ==============================================================================
+-- [ SHARED HELPERS ]
+-- ==============================================================================
+local function isSessionAlive(sessionId)
+    return (not state.IsShutDown)
+        and state.SessionId == sessionId
+        and state.Window ~= nil
+        and state.Window.Context ~= nil
+        and state.Window.Context.IsAlive == true
+end
+
+local function disconnectAll(connList)
+    for i = #connList, 1, -1 do
+        local conn = connList[i]
+        connList[i] = nil
+        if conn then
+            pcall(function()
+                if conn.Connected ~= false then
+                    conn:Disconnect()
+                end
+            end)
+        end
     end
-    local remotesFolder = ReplicatedStorage:WaitForChild("Remotes", 10)
+end
+
+local function safeNotify(title, content, duration)
+    if state.Window and state.Window.Context and state.Window.Context.IsAlive then
+        pcall(function()
+            state.Window:Notify({
+                Title = title,
+                Content = content,
+                Duration = duration or 2
+            })
+        end)
+    end
+end
+
+local function parseMinutes(rawText, fallback)
+    local fb = fallback or DEFAULT_MINUTES
+    local str = tostring(rawText or ""):match("^%s*(.-)%s*$")
+    local n = tonumber(str)
+    if not n or n ~= n or math.abs(n) == math.huge or n <= 0 then
+        return fb, false
+    end
+    if n < MIN_MINUTES then
+        return MIN_MINUTES, true
+    end
+    if n > MAX_MINUTES then
+        return MAX_MINUTES, true
+    end
+    return n, true
+end
+
+local function formatMinutes(mins)
+    if math.abs(mins - math.floor(mins + 0.5)) < 1e-6 then
+        return tostring(math.floor(mins + 0.5))
+    end
+    local formatted = string.format("%.2f", mins):gsub("0+$", ""):gsub("%.$", "")
+    return formatted
+end
+
+local function getConfiguredMinutes(mode)
+    local box = (mode == "Throw") and ThrowTimeBox or TrainTimeBox
+    local fallback = state.Minutes[mode] or DEFAULT_MINUTES
+    if box and type(box.GetValue) == "function" then
+        local parsed, ok = parseMinutes(box:GetValue(), fallback)
+        if ok then
+            state.Minutes[mode] = parsed
+            return parsed
+        end
+    end
+    return fallback
+end
+
+local function getRemote(name)
+    local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:WaitForChild("Remotes", 2)
     if not remotesFolder then
         return nil
     end
-    local remotes = {
-        Start        = remotesFolder:WaitForChild("Throw_Start", 10),
-        MeterStarted = remotesFolder:WaitForChild("Throw_MeterStarted", 10),
-        Resolve      = remotesFolder:WaitForChild("Throw_Resolve", 10),
-        Revealed     = remotesFolder:WaitForChild("Throw_Revealed", 10),
-        Complete     = remotesFolder:WaitForChild("Throw_Complete", 10)
-    }
-    if remotes.Start and remotes.MeterStarted and remotes.Resolve and remotes.Revealed and remotes.Complete then
-        cachedRemotes = remotes
-        return cachedRemotes
-    end
-    return nil
+    return remotesFolder:FindFirstChild(name) or remotesFolder:WaitForChild(name, 2)
 end
 
-local function ensureAtThrowSpot()
+local function callRemote(remote, ...)
+    if not remote then
+        return false, nil
+    end
+    local args = table.pack(...)
+    if remote:IsA("RemoteFunction") then
+        return pcall(function()
+            return remote:InvokeServer(table.unpack(args, 1, args.n))
+        end)
+    elseif remote:IsA("RemoteEvent") then
+        return pcall(function()
+            remote:FireServer(table.unpack(args, 1, args.n))
+        end)
+    end
+    return false, nil
+end
+
+local function teleportRootIfNeeded(targetCFrame, maxDistStuds, postWait)
     local character = LocalPlayer.Character
     local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-    if not rootPart then
+    if not rootPart or not targetCFrame then
         return false
     end
 
-    if (rootPart.Position - CONFIG.TargetCFrame.Position).Magnitude > CONFIG.MaxDistanceStuds then
+    if (rootPart.Position - targetCFrame.Position).Magnitude > maxDistStuds then
         rootPart.AssemblyLinearVelocity = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
-        rootPart.CFrame = CONFIG.TargetCFrame
-        task.wait(CONFIG.PostTeleportWait)
+        rootPart.CFrame = targetCFrame
+        if postWait and postWait > 0 then
+            task.wait(postWait)
+        end
     end
 
     return true
 end
 
+-- Converts shorthand currency strings (e.g. "$650M", "$3.2B", "$31Ocd") into numbers
+local function parseCurrency(text)
+    if type(text) ~= "string" then
+        return nil
+    end
+
+    local lower = text:lower()
+    if lower:find("/s", 1, true) then
+        return nil
+    end
+
+    local cleaned = lower:gsub("[%$,%s]", "")
+    local numStr, suffix = cleaned:match("^(%d+%.?%d*)(%a*)$")
+    local baseNum = tonumber(numStr)
+    if not baseNum then
+        return nil
+    end
+
+    if suffix == "" then
+        return baseNum
+    end
+
+    local mult = MULTIPLIERS[suffix]
+    return mult and (baseNum * mult) or nil
+end
+
+local function getCurrentMoney()
+    local statsGui = PlayerGui:FindFirstChild("StatsGui")
+    local container = statsGui and statsGui:FindFirstChild("Container")
+    local moneyDisplay = container and container:FindFirstChild("MoneyDisplay")
+    local valueLabel = moneyDisplay and moneyDisplay:FindFirstChild("ValueLabel")
+
+    if valueLabel and valueLabel:IsA("TextLabel") then
+        return parseCurrency(valueLabel.Text)
+    end
+
+    return nil
+end
+
+-- ==============================================================================
+-- [ AUTO THROW ENGINE ]
+-- ==============================================================================
 local function getTargetResolveValue(startData)
     if type(startData) == "table" then
         local serverGoal = tonumber(startData.Target or startData.SweetSpot or startData.Goal)
@@ -110,90 +303,608 @@ local function getTargetResolveValue(startData)
                 if lower:find("target") or lower:find("zone") or lower:find("perfect")
                 or lower:find("sweet") or lower:find("green") or lower:find("area") then
                     local targetY = child.Position.Y.Scale
-                    return CONFIG.InvertYScale and (1 - targetY) or targetY
+                    return CONFIG.Throw.InvertYScale and (1 - targetY) or targetY
                 end
             end
         end
     end
 
-    return CONFIG.FallbackValue
+    return CONFIG.Throw.FallbackValue
 end
 
-local function isSessionAlive(sessionId)
-    return state.SessionId == sessionId
-        and state.Window ~= nil
-        and state.Window.Context ~= nil
-        and state.Window.Context.IsAlive == true
-end
+local function runThrowCycle(sessionId, phaseToken)
+    local rStart = getRemote("Throw_Start")
+    local rMeter = getRemote("Throw_MeterStarted")
+    local rResolve = getRemote("Throw_Resolve")
+    local rRevealed = getRemote("Throw_Revealed")
+    local rComplete = getRemote("Throw_Complete")
 
-local function isLoopActive(sessionId)
-    return state.Running and isSessionAlive(sessionId)
-end
-
-local function runThrowCycle(sessionId)
-    local throwRemotes = getThrowRemotes()
-    if not throwRemotes then
+    if not rStart or not rMeter or not rResolve or not rRevealed or not rComplete then
         task.wait(0.5)
         return
     end
 
-    if not ensureAtThrowSpot() then
+    if not teleportRootIfNeeded(CONFIG.Throw.TargetCFrame, CONFIG.Throw.MaxDistanceStuds, CONFIG.Throw.PostTeleportWait) then
         task.wait(0.25)
         return
     end
 
-    local _, startData = pcall(function()
-        return throwRemotes.Start:InvokeServer()
-    end)
-    task.wait(CONFIG.StepDelay)
+    local _, startData = callRemote(rStart)
+    task.wait(CONFIG.Throw.StepDelay)
     if not isSessionAlive(sessionId) then return end
 
-    pcall(function()
-        throwRemotes.MeterStarted:FireServer()
-    end)
-    task.wait(CONFIG.MeterTravelWait)
+    callRemote(rMeter)
+    task.wait(CONFIG.Throw.MeterTravelWait)
     if not isSessionAlive(sessionId) then return end
 
     local resolveValue = getTargetResolveValue(startData)
-    pcall(function()
-        throwRemotes.Resolve:InvokeServer(resolveValue)
-    end)
-    task.wait(CONFIG.StepDelay)
+    callRemote(rResolve, resolveValue)
+    task.wait(CONFIG.Throw.StepDelay)
     if not isSessionAlive(sessionId) then return end
 
-    pcall(function()
-        throwRemotes.Revealed:FireServer()
-    end)
-    task.wait(CONFIG.StepDelay)
+    callRemote(rRevealed)
+    task.wait(CONFIG.Throw.StepDelay)
     if not isSessionAlive(sessionId) then return end
 
-    pcall(function()
-        throwRemotes.Complete:InvokeServer()
-    end)
+    callRemote(rComplete)
 
-    -- Wait for plot transition, then return to throwing area
-    task.wait(CONFIG.PostCompleteDelay)
+    -- Wait for plot transition; only return to throw spot if Throw still owns the scheduler
+    task.wait(CONFIG.Throw.PostCompleteDelay)
     if not isSessionAlive(sessionId) then return end
-    ensureAtThrowSpot()
+    if state.Desired.Throw and state.Farm.ActiveMode == "Throw" and state.Farm.PhaseToken == phaseToken then
+        teleportRootIfNeeded(CONFIG.Throw.TargetCFrame, CONFIG.Throw.MaxDistanceStuds, CONFIG.Throw.PostTeleportWait)
+    end
 end
 
-local function startAutoThrowLoop()
-    if state.Busy then
+-- ==============================================================================
+-- [ AUTO TRAIN ENGINE ]
+-- ==============================================================================
+local function triggerGuiButton(button)
+    if not button or not button:IsA("GuiButton") then
         return
     end
 
-    local mySessionId = state.SessionId
+    local signals = { button.Activated, button.MouseButton1Click, button.MouseButton1Down }
+    local firedCount = 0
+
+    if type(getconnections) == "function" then
+        for _, signal in ipairs(signals) do
+            local okList, conns = pcall(getconnections, signal)
+            if okList and type(conns) == "table" then
+                for _, conn in ipairs(conns) do
+                    if conn.Enabled and conn.Function then
+                        local okFire = pcall(function()
+                            conn:Fire()
+                        end)
+                        if okFire then
+                            firedCount = firedCount + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if firedCount == 0 and type(firesignal) == "function" then
+        for _, signal in ipairs(signals) do
+            pcall(firesignal, signal)
+        end
+    end
+end
+
+local function isTrainTokenActive(sessionId, phaseToken)
+    return isSessionAlive(sessionId)
+        and state.Desired.Train
+        and state.Farm.ActiveMode == "Train"
+        and state.Farm.PhaseToken == phaseToken
+end
+
+local function handleTapBonusButton(btn, sessionId, phaseToken)
+    if not isTrainTokenActive(sessionId, phaseToken) then
+        return
+    end
+    if not btn or btn.Name ~= "TapBonus" or not btn:IsA("GuiButton") then
+        return
+    end
+
+    local lastTapClock = 0
+
+    local function claimWhenVisible()
+        if not isTrainTokenActive(sessionId, phaseToken) then
+            return
+        end
+        if not btn.Parent or not btn.Visible then
+            return
+        end
+
+        task.delay(CONFIG.Train.TapReactionDelay, function()
+            if not isTrainTokenActive(sessionId, phaseToken) then
+                return
+            end
+            if btn.Parent and btn.Visible then
+                local now = os.clock()
+                if now - lastTapClock < CONFIG.Train.TapCooldown then
+                    return
+                end
+                lastTapClock = now
+                triggerGuiButton(btn)
+            end
+        end)
+    end
+
+    if btn.Visible then
+        claimWhenVisible()
+    end
+
+    local visConn, ancConn
+    visConn = btn:GetPropertyChangedSignal("Visible"):Connect(claimWhenVisible)
+    ancConn = btn.AncestryChanged:Connect(function(_, newParent)
+        if newParent == nil then
+            if visConn then pcall(function() visConn:Disconnect() end) end
+            if ancConn then pcall(function() ancConn:Disconnect() end) end
+        end
+    end)
+    table.insert(state.Farm.TrainConnections, visConn)
+    table.insert(state.Farm.TrainConnections, ancConn)
+end
+
+local function setupQteWatcher(sessionId, phaseToken)
+    if state.Farm.WatcherPhaseToken == phaseToken then
+        return
+    end
+    state.Farm.WatcherPhaseToken = phaseToken
+    local ok, err = pcall(function()
+        disconnectAll(state.Farm.TrainConnections)
+        state.Farm.AttachedBonusLayer = nil
+
+        local trainingSeq = PlayerGui:FindFirstChild("TrainingSequence") or PlayerGui:WaitForChild("TrainingSequence", 3)
+        local bonusLayer = trainingSeq and (trainingSeq:FindFirstChild("TapBonusLayer") or trainingSeq:WaitForChild("TapBonusLayer", 3))
+        if not bonusLayer or not isTrainTokenActive(sessionId, phaseToken) then
+            return
+        end
+
+        state.Farm.AttachedBonusLayer = bonusLayer
+        for _, child in ipairs(bonusLayer:GetChildren()) do
+            handleTapBonusButton(child, sessionId, phaseToken)
+        end
+
+        local childConn = bonusLayer.ChildAdded:Connect(function(child)
+            handleTapBonusButton(child, sessionId, phaseToken)
+        end)
+        table.insert(state.Farm.TrainConnections, childConn)
+    end)
+    if state.Farm.WatcherPhaseToken == phaseToken then
+        state.Farm.WatcherPhaseToken = nil
+    end
+    if not ok then
+        warn("[AutoTrain] QTE watcher error: " .. tostring(err))
+    end
+end
+
+local function getPullUpStandCFrame()
+    local plotIndex = LocalPlayer:GetAttribute("PlotIndex")
+    if plotIndex == nil then
+        if not state.Farm.MissingStandWarned then
+            state.Farm.MissingStandWarned = true
+            warn("[AutoTrain] PlotIndex attribute is nil.")
+        end
+        return nil
+    end
+
+    local plotsFolder = Workspace:FindFirstChild("Plots")
+    local myPlot = plotsFolder and plotsFolder:FindFirstChild(tostring(plotIndex))
+    local serverFolder = myPlot and myPlot:FindFirstChild("Server")
+    local pullUpStand = serverFolder and serverFolder:FindFirstChild("PullUpStand")
+    if not pullUpStand then
+        if not state.Farm.MissingStandWarned then
+            state.Farm.MissingStandWarned = true
+            warn("[AutoTrain] PullUpStand not found in Plot " .. tostring(plotIndex))
+        end
+        return nil
+    end
+
+    state.Farm.MissingStandWarned = false
+    local baseCFrame = nil
+    if pullUpStand:IsA("Model") then
+        baseCFrame = pullUpStand:GetPivot()
+    elseif pullUpStand:IsA("BasePart") then
+        baseCFrame = pullUpStand.CFrame
+    end
+    if not baseCFrame then
+        return nil
+    end
+    return baseCFrame * CONFIG.Train.StandOffset
+end
+
+local function stopTrainPhase(sendStopRemote)
+    disconnectAll(state.Farm.TrainConnections)
+    state.Farm.AttachedBonusLayer = nil
+    if state.Farm.TrainStarted then
+        state.Farm.TrainStarted = false
+        if sendStopRemote then
+            local rStop = getRemote("Training_Stop")
+            if rStop then
+                callRemote(rStop)
+            end
+        end
+    end
+end
+
+-- ==============================================================================
+-- [ UNIFIED FARM SCHEDULER (AUTO THROW <-> AUTO TRAIN) ]
+-- ==============================================================================
+local function beginPhase(mode, notifyMsg)
+    state.Farm.ActiveMode = mode
+    state.Farm.PhaseToken = state.Farm.PhaseToken + 1
+    state.Farm.PhaseStart = os.clock()
+    state.Farm.ResetCountdownRequested = false
+    if notifyMsg then
+        safeNotify("Auto Farm", notifyMsg, 2.5)
+    end
+    return state.Farm.PhaseToken
+end
+
+local function runThrowPhase(mySession)
+    local phaseToken = beginPhase("Throw", nil)
+    print("[AutoThrow] Active.")
+
+    while isSessionAlive(mySession) and state.Desired.Throw and state.Farm.ActiveMode == "Throw" do
+        if state.Farm.ResetCountdownRequested then
+            state.Farm.PhaseStart = os.clock()
+            state.Farm.ResetCountdownRequested = false
+        end
+
+        if state.Desired.Train then
+            local throwLimitSec = getConfiguredMinutes("Throw") * 60
+            if (os.clock() - state.Farm.PhaseStart) >= throwLimitSec then
+                break
+            end
+        end
+
+        runThrowCycle(mySession, phaseToken)
+
+        if state.Desired.Train and state.Desired.Throw then
+            local throwLimitSec = getConfiguredMinutes("Throw") * 60
+            if (os.clock() - state.Farm.PhaseStart) >= throwLimitSec then
+                break
+            end
+        end
+    end
+end
+
+local function runTrainPhase(mySession, initialTimed)
+    local timed = (initialTimed == true)
+    local msg = timed and string.format("Switching to Auto Train (%s min)...", formatMinutes(getConfiguredMinutes("Train"))) or nil
+    local trainToken = beginPhase("Train", msg)
+    print("[AutoTrain] Active.")
+    state.Farm.MissingStandWarned = false
+    state.Farm.TrainStarted = true
+    teleportRootIfNeeded(getPullUpStandCFrame(), CONFIG.Train.MaxDistanceStuds, 0)
+    task.spawn(setupQteWatcher, mySession, trainToken)
+
+    while isSessionAlive(mySession) and state.Desired.Train and state.Farm.ActiveMode == "Train" do
+        if state.Farm.WatcherPhaseToken ~= trainToken
+           and (not state.Farm.AttachedBonusLayer or not state.Farm.AttachedBonusLayer:IsDescendantOf(PlayerGui)) then
+            task.spawn(setupQteWatcher, mySession, trainToken)
+        end
+
+        if not state.Desired.Throw then
+            -- Dropped to solo Train mode; if Throw is re-enabled later, switch cleanly to Throw first
+            timed = false
+            teleportRootIfNeeded(getPullUpStandCFrame(), CONFIG.Train.MaxDistanceStuds, 0)
+            task.wait(CONFIG.Train.MonitorInterval)
+        elseif not timed then
+            -- Solo Train while Throw was just turned ON -> yield to Throw first
+            break
+        else
+            local trainLimitSec = getConfiguredMinutes("Train") * 60
+            local remaining = trainLimitSec - (os.clock() - state.Farm.PhaseStart)
+            if remaining <= 0 then
+                break
+            end
+            teleportRootIfNeeded(getPullUpStandCFrame(), CONFIG.Train.MaxDistanceStuds, 0)
+            task.wait(math.min(CONFIG.Train.MonitorInterval, math.max(0.1, remaining)))
+        end
+    end
+
+    stopTrainPhase(true)
+end
+
+local function startFarmSchedulerIfNeeded()
+    if state.Farm.SchedulerRunning then
+        return
+    end
+
+    local mySession = state.SessionId
+    state.Farm.SchedulerRunning = true
+
     task.spawn(function()
-        state.Busy = true
-        while isLoopActive(mySessionId) do
-            runThrowCycle(mySessionId)
+        while isSessionAlive(mySession) and (state.Desired.Throw or state.Desired.Train) do
+            local okPhase, errPhase = pcall(function()
+                if state.Desired.Throw then
+                    runThrowPhase(mySession)
+                    if isSessionAlive(mySession) and state.Desired.Throw and state.Desired.Train then
+                        runTrainPhase(mySession, true)
+                        if isSessionAlive(mySession) and state.Desired.Throw and state.Desired.Train then
+                            safeNotify(
+                                "Auto Farm",
+                                string.format("Switching to Auto Throw (%s min)...", formatMinutes(getConfiguredMinutes("Throw"))),
+                                2.5
+                            )
+                        end
+                    end
+                else
+                    runTrainPhase(mySession, false)
+                end
+            end)
+
+            if not okPhase then
+                warn("[AutoFarm] Phase error: " .. tostring(errPhase))
+                stopTrainPhase(true)
+                task.wait(1)
+            end
         end
-        if state.SessionId == mySessionId then
-            state.Busy = false
+
+        stopTrainPhase(true)
+        if state.SessionId == mySession then
+            state.Farm.ActiveMode = nil
+            state.Farm.SchedulerRunning = false
         end
-        print("[AutoThrow] Stopped cleanly.")
+        print("[AutoFarm] Scheduler stopped cleanly.")
     end)
 end
+
+-- ==============================================================================
+-- [ AUTO UPGRADE (PULL-UP STAND) ]
+-- ==============================================================================
+local function isEffectivelyVisible(guiObj, stopAt)
+    local cur = guiObj
+    while cur and cur ~= stopAt do
+        if cur:IsA("GuiObject") and not cur.Visible then
+            return false
+        elseif cur:IsA("LayerCollector") and not cur.Enabled then
+            return false
+        end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function inspectUpgradeSign()
+    local searchRoots = {}
+
+    local plotIndex = LocalPlayer:GetAttribute("PlotIndex")
+    if plotIndex ~= nil then
+        local plotsFolder = Workspace:FindFirstChild("Plots")
+        local myPlot = plotsFolder and plotsFolder:FindFirstChild(tostring(plotIndex))
+        local serverFolder = myPlot and myPlot:FindFirstChild("Server")
+        local pullUpStand = serverFolder and serverFolder:FindFirstChild("PullUpStand")
+        if pullUpStand then
+            table.insert(searchRoots, pullUpStand)
+        end
+    end
+
+    local localProps = Workspace:FindFirstChild("LocalPlotProps")
+    local trainingArea = localProps and localProps:FindFirstChild("TrainingArea")
+    if trainingArea then
+        table.insert(searchRoots, trainingArea)
+    end
+
+    local firstPrice = nil
+
+    for _, root in ipairs(searchRoots) do
+        for _, desc in ipairs(root:GetDescendants()) do
+            if desc:IsA("TextLabel") and isEffectivelyVisible(desc, root) then
+                local text = desc.Text
+                local trimmedUpper = text:match("^%s*(.-)%s*$"):upper()
+                if trimmedUpper == "MAX" or trimmedUpper == "MAXED" or trimmedUpper == "MAX LEVEL" then
+                    return "MAX", nil
+                end
+                if not firstPrice and text:find("%$") then
+                    local cost = parseCurrency(text)
+                    if cost and cost > 0 then
+                        firstPrice = cost
+                    end
+                end
+            end
+        end
+    end
+
+    if firstPrice then
+        return "PRICE", firstPrice
+    end
+
+    return "NONE", nil
+end
+
+local function startAutoUpgradeLoop()
+    state.Tokens.Upgrade = state.Tokens.Upgrade + 1
+    local myToken = state.Tokens.Upgrade
+    local mySession = state.SessionId
+
+    task.spawn(function()
+        while isSessionAlive(mySession) and state.Desired.Upgrade and state.Tokens.Upgrade == myToken do
+            local okIter, signStatus, upgradeCost = pcall(inspectUpgradeSign)
+            if okIter then
+                if signStatus == "MAX" then
+                    state.Desired.Upgrade = false
+                    state.Tokens.Upgrade = state.Tokens.Upgrade + 1
+                    if UpgradeToggle and type(UpgradeToggle.SetValue) == "function" then
+                        pcall(function()
+                            UpgradeToggle:SetValue(false, false)
+                        end)
+                    end
+                    print("[AutoUpgrade] Max level reached. Stopped cleanly.")
+                    safeNotify("Auto Upgrade", "Max level reached! Auto Upgrade stopped.", 3)
+                    break
+                end
+
+                if signStatus == "PRICE" and upgradeCost then
+                    local currentMoney = getCurrentMoney()
+                    if currentMoney and currentMoney >= upgradeCost then
+                        local rUpgrade = getRemote("Stand_Upgrade")
+                        if rUpgrade then
+                            local okCall = callRemote(rUpgrade)
+                            task.wait(okCall and math.max(0.5, CONFIG.Upgrade.PostUpgradeDelay) or CONFIG.Upgrade.CheckInterval)
+                            continue
+                        end
+                    end
+                end
+            end
+
+            task.wait(CONFIG.Upgrade.CheckInterval)
+        end
+    end)
+end
+
+-- ==============================================================================
+-- [ AUTO BUY FOOD ]
+-- ==============================================================================
+local function getCardsContainer()
+    local foodShop = PlayerGui:FindFirstChild("FoodShop")
+    local main = foodShop and foodShop:FindFirstChild("Main")
+    local panel = main and main:FindFirstChild("Panel")
+    local body = panel and panel:FindFirstChild("Body")
+    return body and body:FindFirstChild("CardsScroll")
+end
+
+-- Returns ("BUY", nextItem), ("MAX", nil), or ("LOADING", nil)
+local function evaluateFoodShop()
+    local cardsScroll = getCardsContainer()
+    if not cardsScroll then
+        return "LOADING", nil
+    end
+
+    local totalCards = 0
+    local highestOwnedId = 0
+    local maxShopId = 0
+    local unownedFoods = {}
+
+    for _, card in ipairs(cardsScroll:GetChildren()) do
+        local foodId = tonumber(card.Name:match("^Food(%d+)$"))
+        if foodId then
+            totalCards = totalCards + 1
+            if foodId > maxShopId then
+                maxShopId = foodId
+            end
+
+            local statusLabel = card:FindFirstChild("Label", true)
+            if statusLabel and statusLabel:IsA("TextLabel") then
+                local rawText = statusLabel.Text
+                local upperText = rawText:gsub("%s+", ""):upper()
+
+                if upperText == "EQUIP" or upperText == "EQUIPPED" then
+                    if foodId > highestOwnedId then
+                        highestOwnedId = foodId
+                    end
+                elseif rawText:find("%$") then
+                    local cost = parseCurrency(rawText)
+                    if cost and cost > 0 then
+                        table.insert(unownedFoods, { id = foodId, price = cost })
+                    end
+                end
+            end
+        end
+    end
+
+    if totalCards == 0 then
+        return "LOADING", nil
+    end
+
+    if highestOwnedId >= maxShopId then
+        return "MAX", nil
+    end
+
+    table.sort(unownedFoods, function(a, b)
+        return a.id < b.id
+    end)
+
+    for _, item in ipairs(unownedFoods) do
+        if item.id > highestOwnedId then
+            return "BUY", item
+        end
+    end
+
+    return "LOADING", nil
+end
+
+local function startAutoFoodLoop()
+    state.Tokens.Food = state.Tokens.Food + 1
+    local myToken = state.Tokens.Food
+    local mySession = state.SessionId
+
+    task.spawn(function()
+        while isSessionAlive(mySession) and state.Desired.Food and state.Tokens.Food == myToken do
+            local okIter, status, nextFood = pcall(evaluateFoodShop)
+            if okIter then
+                if status == "MAX" then
+                    state.Desired.Food = false
+                    state.Tokens.Food = state.Tokens.Food + 1
+                    if FoodToggle and type(FoodToggle.SetValue) == "function" then
+                        pcall(function()
+                            FoodToggle:SetValue(false, false)
+                        end)
+                    end
+                    print("[AutoFood] All max-tier foods owned. Stopped cleanly.")
+                    safeNotify("Auto Buy Food", "All max-tier foods owned! Stopped.", 3)
+                    break
+                end
+
+                if status == "BUY" and nextFood then
+                    local currentMoney = getCurrentMoney()
+                    if currentMoney and currentMoney >= nextFood.price then
+                        local rBuy = getRemote("Shop_Buy")
+                        if rBuy then
+                            local okCall = callRemote(rBuy, nextFood.id)
+                            task.wait(okCall and CONFIG.Food.PostBuyDelay or CONFIG.Food.CheckInterval)
+                            continue
+                        end
+                    end
+                end
+            end
+
+            task.wait(CONFIG.Food.CheckInterval)
+        end
+    end)
+end
+
+-- ==============================================================================
+-- [ TEARDOWN / SHUTDOWN ]
+-- ==============================================================================
+function state.Shutdown()
+    if state.IsShutDown then
+        return
+    end
+    state.IsShutDown = true
+    state.Desired.Throw = false
+    state.Desired.Train = false
+    state.Desired.Upgrade = false
+    state.Desired.Food = false
+    state.SessionId = state.SessionId + 1
+    state.Farm.PhaseToken = state.Farm.PhaseToken + 1
+    state.Tokens.Upgrade = state.Tokens.Upgrade + 1
+    state.Tokens.Food = state.Tokens.Food + 1
+
+    disconnectAll(state.Farm.TrainConnections)
+    if state.Farm.TrainStarted then
+        state.Farm.TrainStarted = false
+        task.spawn(function()
+            local rStop = getRemote("Training_Stop")
+            if rStop then
+                callRemote(rStop)
+            end
+        end)
+    end
+
+    if state.Window and type(state.Window.Destroy) == "function" then
+        local w = state.Window
+        state.Window = nil
+        pcall(function()
+            w:Destroy()
+        end)
+    end
+end
+env.ThrowBySyntaxState = state
 
 -- ==============================================================================
 -- [ GUI INITIALIZATION & CONTROLS VIA GUILIB ]
@@ -215,8 +926,8 @@ local Window = SyntaxisLib:CreateWindow({
     LoaderBlur = true,
     LoaderSteps = {
         { Threshold = 0.22, Step = "01 / 05", Text = "Loading Throw Food For Animals..." },
-        { Threshold = 0.48, Step = "02 / 05", Text = "Connecting throw remotes..." },
-        { Threshold = 0.72, Step = "03 / 05", Text = "Initializing Auto Farm controls..." },
+        { Threshold = 0.48, Step = "02 / 05", Text = "Connecting game remotes..." },
+        { Threshold = 0.72, Step = "03 / 05", Text = "Initializing Auto Farm & Auto Upgrades..." },
         { Threshold = 0.88, Step = "04 / 05", Text = "Applying Liquid Glass theme..." },
         { Threshold = 1.00, Step = "05 / 05", Text = "Ready to throw!" }
     },
@@ -227,36 +938,127 @@ state.Window = Window
 
 if Window.ScreenGui then
     Window.ScreenGui.Destroying:Connect(function()
-        state.Running = false
+        state.Shutdown()
     end)
 end
 
 -- Sidebar Tab: Farm
 local FarmTab = Window:CreateTab("Farm", "Farm")
 
--- Category: Auto Farm
+-- Category 1: Auto Farm
 local CatAutoFarm = FarmTab:CreateCategory("Auto Farm", true, 1)
 
--- Feature: Auto Throw
-CatAutoFarm:CreateToggle("Auto Throw", "Automatically teleports to throw spot and hits target meter", false, function(enabled)
-    state.Running = enabled
-    if enabled then
-        print("[AutoThrow] Enabled.")
-        Window:Notify({
-            Title = "Auto Throw",
-            Content = "Auto Throw enabled.",
-            Duration = 2
-        })
-        startAutoThrowLoop()
+CatAutoFarm:CreateToggle("Auto Throw", "Teleports to throw spot and hits target meter", false, function(enabled)
+    state.Desired.Throw = (enabled == true)
+    if state.Desired.Throw then
+        if state.Desired.Train then
+            local throwMins = getConfiguredMinutes("Throw")
+            safeNotify(
+                "Auto Throw",
+                string.format("Enabled (%s min before Auto Train).", formatMinutes(throwMins)),
+                2.5
+            )
+        else
+            safeNotify("Auto Throw", "Auto Throw enabled.", 2)
+        end
+        startFarmSchedulerIfNeeded()
     else
-        print("[AutoThrow] Turning off after current throw finishes...")
-        Window:Notify({
-            Title = "Auto Throw",
-            Content = "Turning off after current throw finishes...",
-            Duration = 2
-        })
+        safeNotify("Auto Throw", "Turning off after current throw finishes...", 2)
     end
-end)
+end, 1)
+
+ThrowTimeBox = CatAutoFarm:CreateTextbox(
+    "Auto Throw Time (Mins)",
+    "Minutes to run Auto Throw before switching to Auto Train",
+    "e.g. 10",
+    tostring(DEFAULT_MINUTES),
+    function(text)
+        local mins, ok = parseMinutes(text, state.Minutes.Throw)
+        state.Minutes.Throw = mins
+        if ThrowTimeBox and type(ThrowTimeBox.SetValue) == "function" then
+            ThrowTimeBox:SetValue(formatMinutes(mins))
+        end
+        if not ok then
+            safeNotify("Auto Throw Timer", "Invalid number; reset to " .. formatMinutes(mins) .. " min.", 2)
+        end
+    end,
+    2
+)
+
+CatAutoFarm:CreateToggle("Auto Train", "Teleports to PullUpStand and auto-taps training QTE", false, function(enabled)
+    state.Desired.Train = (enabled == true)
+    if state.Desired.Train then
+        if state.Desired.Throw and state.Farm.ActiveMode == "Throw" then
+            state.Farm.ResetCountdownRequested = true
+            local throwMins = getConfiguredMinutes("Throw")
+            safeNotify(
+                "Auto Train",
+                string.format("Queued! Switching after %s min of Auto Throw.", formatMinutes(throwMins)),
+                2.5
+            )
+        else
+            safeNotify("Auto Train", "Auto Train enabled.", 2)
+        end
+        startFarmSchedulerIfNeeded()
+    else
+        safeNotify("Auto Train", "Auto Train disabled.", 2)
+    end
+end, 3)
+
+TrainTimeBox = CatAutoFarm:CreateTextbox(
+    "Auto Train Time (Mins)",
+    "Minutes to run Auto Train before switching to Auto Throw",
+    "e.g. 10",
+    tostring(DEFAULT_MINUTES),
+    function(text)
+        local mins, ok = parseMinutes(text, state.Minutes.Train)
+        state.Minutes.Train = mins
+        if TrainTimeBox and type(TrainTimeBox.SetValue) == "function" then
+            TrainTimeBox:SetValue(formatMinutes(mins))
+        end
+        if not ok then
+            safeNotify("Auto Train Timer", "Invalid number; reset to " .. formatMinutes(mins) .. " min.", 2)
+        end
+    end,
+    4
+)
+
+-- Category 2: Auto Upgrades
+local CatAutoUpgrades = FarmTab:CreateCategory("Auto Upgrades", true, 2)
+
+UpgradeToggle = CatAutoUpgrades:CreateToggle(
+    "Auto Upgrade",
+    "Automatically upgrades PullUpStand when you have enough cash",
+    false,
+    function(enabled)
+        state.Desired.Upgrade = (enabled == true)
+        if state.Desired.Upgrade then
+            safeNotify("Auto Upgrade", "Auto Upgrade enabled.", 2)
+            startAutoUpgradeLoop()
+        else
+            state.Tokens.Upgrade = state.Tokens.Upgrade + 1
+            safeNotify("Auto Upgrade", "Auto Upgrade disabled.", 2)
+        end
+    end,
+    1
+)
+
+FoodToggle = CatAutoUpgrades:CreateToggle(
+    "Auto Buy Food",
+    "Automatically buys the next unowned food when affordable",
+    false,
+    function(enabled)
+        state.Desired.Food = (enabled == true)
+        if state.Desired.Food then
+            safeNotify("Auto Buy Food", "Auto Buy Food enabled.", 2)
+            startAutoFoodLoop()
+        else
+            state.Tokens.Food = state.Tokens.Food + 1
+            safeNotify("Auto Buy Food", "Auto Buy Food disabled.", 2)
+        end
+    end,
+    2
+)
 
 -- Sidebar Tab: Settings
 Window:CreateSettingsTab("Settings", "Settings", {
