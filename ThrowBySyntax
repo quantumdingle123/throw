@@ -1,9 +1,3 @@
--- ==============================================================================
--- [ SYNTAX HUB - THROW FOOD FOR ANIMALS (ThrowBySyntax) ]
--- Built with Syntaxis GUI Library v2.3.0 (https://github.com/quantumdingle123/GUILib)
--- Repository: https://github.com/quantumdingle123/throw
--- ==============================================================================
-
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
