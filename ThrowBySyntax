@@ -56,6 +56,10 @@ local CONFIG = {
         CheckInterval = 1.00,
         PostUpgradeDelay = 0.35
     },
+    PlotUpgrade = {
+        CheckInterval = 1.00,
+        PostUpgradeDelay = 0.50
+    },
     Food = {
         CheckInterval = 1.00,
         PostBuyDelay = 0.50
@@ -98,6 +102,7 @@ local state = {
         Throw = false,
         Train = false,
         Upgrade = false,
+        PlotUpgrade = false,
         Food = false,
         EquipBest = false
     },
@@ -119,6 +124,7 @@ local state = {
     },
     Tokens = {
         Upgrade = 0,
+        PlotUpgrade = 0,
         Food = 0,
         EquipBest = 0
     },
@@ -127,7 +133,7 @@ local state = {
 
 -- Forward declarations for UI control references used by background loops
 local ThrowTimeBox, TrainTimeBox
-local UpgradeToggle, FoodToggle
+local UpgradeToggle, PlotUpgradeToggle, FoodToggle
 
 -- ==============================================================================
 -- [ SHARED HELPERS ]
@@ -671,7 +677,7 @@ local function startFarmSchedulerIfNeeded()
 end
 
 -- ==============================================================================
--- [ AUTO UPGRADE (PULL-UP STAND) ]
+-- [ AUTO UPGRADES (PULL-UP STAND & PLOT FENCE) ]
 -- ==============================================================================
 local function isEffectivelyVisible(guiObj, stopAt)
     local cur = guiObj
@@ -686,7 +692,7 @@ local function isEffectivelyVisible(guiObj, stopAt)
     return true
 end
 
-local function inspectUpgradeSign()
+local function getStandUpgradeRoots()
     local searchRoots = {}
 
     local plotIndex = LocalPlayer:GetAttribute("PlotIndex")
@@ -706,6 +712,20 @@ local function inspectUpgradeSign()
         table.insert(searchRoots, trainingArea)
     end
 
+    return searchRoots
+end
+
+local function getPlotUpgradeRoots()
+    local localProps = Workspace:FindFirstChild("LocalPlotProps")
+    local upgradeSign = localProps and localProps:FindFirstChild("PlotUpgradeSign")
+    if upgradeSign then
+        return { upgradeSign }
+    end
+    return {}
+end
+
+local function inspectSignRoots(getRootsFn)
+    local searchRoots = getRootsFn()
     local firstPrice = nil
 
     for _, root in ipairs(searchRoots) do
@@ -733,42 +753,65 @@ local function inspectUpgradeSign()
     return "NONE", nil
 end
 
-local function startAutoUpgradeLoop()
-    state.Tokens.Upgrade = state.Tokens.Upgrade + 1
-    local myToken = state.Tokens.Upgrade
+local function startSignUpgradeLoop(opts)
+    local desiredKey = opts.DesiredKey
+    local tokenKey = opts.TokenKey
+    state.Tokens[tokenKey] = state.Tokens[tokenKey] + 1
+    local myToken = state.Tokens[tokenKey]
     local mySession = state.SessionId
 
     task.spawn(function()
-        while isSessionAlive(mySession) and state.Desired.Upgrade and state.Tokens.Upgrade == myToken do
-            local okIter, signStatus, upgradeCost = pcall(inspectUpgradeSign)
+        local sameCount = 0
+        local lastCost = nil
+        local lastMoney = nil
+
+        while isSessionAlive(mySession) and state.Desired[desiredKey] and state.Tokens[tokenKey] == myToken do
+            local okIter, signStatus, upgradeCost = pcall(inspectSignRoots, opts.GetRoots)
             if okIter then
                 if signStatus == "MAX" then
-                    state.Desired.Upgrade = false
-                    state.Tokens.Upgrade = state.Tokens.Upgrade + 1
-                    if UpgradeToggle and type(UpgradeToggle.SetValue) == "function" then
+                    state.Desired[desiredKey] = false
+                    state.Tokens[tokenKey] = state.Tokens[tokenKey] + 1
+                    local toggleObj = opts.GetToggle and opts.GetToggle()
+                    if toggleObj and type(toggleObj.SetValue) == "function" then
                         pcall(function()
-                            UpgradeToggle:SetValue(false, false)
+                            toggleObj:SetValue(false, false)
                         end)
                     end
-                    print("[AutoUpgrade] Max level reached. Stopped cleanly.")
-                    safeNotify("Auto Upgrade", "Max level reached! Auto Upgrade stopped.", 3)
+                    print(string.format("[%s] Max level reached. Stopped cleanly.", opts.LogTag))
+                    safeNotify(opts.Label, "Max level reached! " .. opts.Label .. " stopped.", 3)
                     break
                 end
 
                 if signStatus == "PRICE" and upgradeCost then
                     local currentMoney = getCurrentMoney()
                     if currentMoney and currentMoney >= upgradeCost then
-                        local rUpgrade = getRemote("Stand_Upgrade")
-                        if rUpgrade then
-                            local okCall = callRemote(rUpgrade)
-                            task.wait(okCall and math.max(0.5, CONFIG.Upgrade.PostUpgradeDelay) or CONFIG.Upgrade.CheckInterval)
+                        if lastCost == upgradeCost and lastMoney == currentMoney then
+                            sameCount = sameCount + 1
+                        else
+                            sameCount = 0
+                        end
+                        lastCost = upgradeCost
+                        lastMoney = currentMoney
+
+                        local remote = getRemote(opts.RemoteName)
+                        if remote then
+                            local okCall = callRemote(remote)
+                            local waitSec = okCall and math.max(0.5, opts.PostDelay) or opts.CheckInterval
+                            if sameCount >= 3 then
+                                waitSec = 5.0
+                            end
+                            task.wait(waitSec)
                             continue
                         end
+                    else
+                        sameCount = 0
                     end
+                else
+                    sameCount = 0
                 end
             end
 
-            task.wait(CONFIG.Upgrade.CheckInterval)
+            task.wait(opts.CheckInterval)
         end
     end)
 end
@@ -919,11 +962,13 @@ function state.Shutdown()
     state.Desired.Throw = false
     state.Desired.Train = false
     state.Desired.Upgrade = false
+    state.Desired.PlotUpgrade = false
     state.Desired.Food = false
     state.Desired.EquipBest = false
     state.SessionId = state.SessionId + 1
     state.Farm.PhaseToken = state.Farm.PhaseToken + 1
     state.Tokens.Upgrade = state.Tokens.Upgrade + 1
+    state.Tokens.PlotUpgrade = state.Tokens.PlotUpgrade + 1
     state.Tokens.Food = state.Tokens.Food + 1
     state.Tokens.EquipBest = state.Tokens.EquipBest + 1
 
@@ -1091,13 +1136,23 @@ local CatAutoUpgrades = FarmTab:CreateCategory("Auto Upgrades", true, 2)
 
 UpgradeToggle = CatAutoUpgrades:CreateToggle(
     "Auto Upgrade",
-    "Automatically upgrades PullUpStand when you have enough cash",
+    "Upgrades PullUpStand when you have enough cash",
     false,
     function(enabled)
         state.Desired.Upgrade = (enabled == true)
         if state.Desired.Upgrade then
             safeNotify("Auto Upgrade", "Auto Upgrade enabled.", 2)
-            startAutoUpgradeLoop()
+            startSignUpgradeLoop({
+                DesiredKey = "Upgrade",
+                TokenKey = "Upgrade",
+                RemoteName = "Stand_Upgrade",
+                GetRoots = getStandUpgradeRoots,
+                CheckInterval = CONFIG.Upgrade.CheckInterval,
+                PostDelay = CONFIG.Upgrade.PostUpgradeDelay,
+                GetToggle = function() return UpgradeToggle end,
+                Label = "Auto Upgrade",
+                LogTag = "AutoUpgrade"
+            })
         else
             state.Tokens.Upgrade = state.Tokens.Upgrade + 1
             safeNotify("Auto Upgrade", "Auto Upgrade disabled.", 2)
@@ -1106,9 +1161,36 @@ UpgradeToggle = CatAutoUpgrades:CreateToggle(
     1
 )
 
+PlotUpgradeToggle = CatAutoUpgrades:CreateToggle(
+    "Auto Upgrade Plot",
+    "Upgrades plot fence via PlotUpgradeSign when affordable",
+    false,
+    function(enabled)
+        state.Desired.PlotUpgrade = (enabled == true)
+        if state.Desired.PlotUpgrade then
+            safeNotify("Auto Upgrade Plot", "Auto Upgrade Plot enabled.", 2)
+            startSignUpgradeLoop({
+                DesiredKey = "PlotUpgrade",
+                TokenKey = "PlotUpgrade",
+                RemoteName = "Plot_UpgradeFence",
+                GetRoots = getPlotUpgradeRoots,
+                CheckInterval = CONFIG.PlotUpgrade.CheckInterval,
+                PostDelay = CONFIG.PlotUpgrade.PostUpgradeDelay,
+                GetToggle = function() return PlotUpgradeToggle end,
+                Label = "Auto Upgrade Plot",
+                LogTag = "AutoPlotUpgrade"
+            })
+        else
+            state.Tokens.PlotUpgrade = state.Tokens.PlotUpgrade + 1
+            safeNotify("Auto Upgrade Plot", "Auto Upgrade Plot disabled.", 2)
+        end
+    end,
+    2
+)
+
 FoodToggle = CatAutoUpgrades:CreateToggle(
     "Auto Buy Food",
-    "Automatically buys the next unowned food when affordable",
+    "Buys the next unowned food when affordable",
     false,
     function(enabled)
         state.Desired.Food = (enabled == true)
@@ -1120,7 +1202,7 @@ FoodToggle = CatAutoUpgrades:CreateToggle(
             safeNotify("Auto Buy Food", "Auto Buy Food disabled.", 2)
         end
     end,
-    2
+    3
 )
 
 -- Sidebar Tab: Settings
