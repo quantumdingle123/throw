@@ -129,9 +129,7 @@ local state = {
 local ThrowTimeBox, TrainTimeBox
 local UpgradeToggle, PlotUpgradeToggle, FoodToggle
 
--- ==============================================================================
--- [ SHARED HELPERS ]
--- ==============================================================================
+-- Shared helpers
 local function isSessionAlive(sessionId)
     return (not state.IsShutDown)
         and state.SessionId == sessionId
@@ -293,9 +291,7 @@ local function invokeEquipBest()
     end
 end
 
--- ==============================================================================
--- [ AUTO THROW ENGINE ]
--- ==============================================================================
+-- Auto Throw
 local function getTargetResolveValue(startData)
     if type(startData) == "table" then
         local serverGoal = tonumber(startData.Target or startData.SweetSpot or startData.Goal)
@@ -372,9 +368,7 @@ local function runThrowCycle(sessionId, phaseToken)
     end
 end
 
--- ==============================================================================
--- [ AUTO TRAIN ENGINE ]
--- ==============================================================================
+-- Auto Train
 local function triggerGuiButton(button)
     if not button or not button:IsA("GuiButton") then
         return
@@ -546,9 +540,7 @@ local function stopTrainPhase(sendStopRemote)
     end
 end
 
--- ==============================================================================
--- [ UNIFIED FARM SCHEDULER (AUTO THROW <-> AUTO TRAIN) ]
--- ==============================================================================
+-- Farm scheduler (alternates Auto Throw and Auto Train)
 local function beginPhase(mode, notifyMsg)
     state.Farm.ActiveMode = mode
     state.Farm.PhaseToken = state.Farm.PhaseToken + 1
@@ -670,9 +662,7 @@ local function startFarmSchedulerIfNeeded()
     end)
 end
 
--- ==============================================================================
--- [ AUTO UPGRADES (PULL-UP STAND & PLOT FENCE) ]
--- ==============================================================================
+-- Auto Upgrades (PullUpStand and PlotUpgradeSign)
 local function isEffectivelyVisible(guiObj, stopAt)
     local cur = guiObj
     while cur and cur ~= stopAt do
@@ -810,9 +800,7 @@ local function startSignUpgradeLoop(opts)
     end)
 end
 
--- ==============================================================================
--- [ AUTO BUY FOOD ]
--- ==============================================================================
+-- Auto Buy Food
 local function getCardsContainer()
     local foodShop = PlayerGui:FindFirstChild("FoodShop")
     local main = foodShop and foodShop:FindFirstChild("Main")
@@ -921,9 +909,7 @@ local function startAutoFoodLoop()
     end)
 end
 
--- ==============================================================================
--- [ AUTO EQUIP BEST PET ]
--- ==============================================================================
+-- Auto Equip Best Pet
 local function startAutoEquipBestLoop()
     state.Tokens.EquipBest = state.Tokens.EquipBest + 1
     local myToken = state.Tokens.EquipBest
@@ -945,9 +931,7 @@ local function startAutoEquipBestLoop()
     end)
 end
 
--- ==============================================================================
--- [ TEARDOWN / SHUTDOWN ]
--- ==============================================================================
+-- Shutdown / cleanup
 function state.Shutdown()
     if state.IsShutDown then
         return
@@ -987,9 +971,7 @@ function state.Shutdown()
 end
 env.ThrowBySyntaxState = state
 
--- ==============================================================================
--- [ GUI INITIALIZATION & CONTROLS VIA GUILIB ]
--- ==============================================================================
+-- UI setup
 local SyntaxisLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/quantumdingle123/GUILib/main/SyntaxisLib.lua"))()
 
 local UiState = {
