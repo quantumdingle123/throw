@@ -206,13 +206,20 @@ local UiState = {
 
 local Window = SyntaxisLib:CreateWindow({
     Title = "Syntaxis",
-    GameName = "Throw",
+    GameName = "Throw Food For Animals",
     GuiName = "ThrowBySyntaxGUI",
     Theme = UiState.themeName,
     ShowLoader = true,
     LoaderLayout = "B",
-    LoaderDuration = 2.6,
+    LoaderDuration = 2.8,
     LoaderBlur = true,
+    LoaderSteps = {
+        { Threshold = 0.22, Step = "01 / 05", Text = "Loading Throw Food For Animals..." },
+        { Threshold = 0.48, Step = "02 / 05", Text = "Connecting throw remotes..." },
+        { Threshold = 0.72, Step = "03 / 05", Text = "Initializing Auto Farm controls..." },
+        { Threshold = 0.88, Step = "04 / 05", Text = "Applying Liquid Glass theme..." },
+        { Threshold = 1.00, Step = "05 / 05", Text = "Ready to throw!" }
+    },
     State = UiState
 })
 
